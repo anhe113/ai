@@ -1,0 +1,109 @@
+name: Daily Memory Backup
+
+# Backs up the Ombre Brain memory vault from the live Zeabur deployment.
+# Strategy:
+#   1. Curl /backup?token=... to get a tar.gz of the buckets dir
+#   2. Extract raw .md files into backups/buckets/   (git-diff-friendly)
+#   3. Save full tar.gz into backups/snapshots/YYYY-MM-DD.tar.gz
+#   4. Build backups/manifest-latest.json (id/name/importance/last_active)
+#   5. Commit + push if anything changed
+#
+# Required secrets:
+#   OMBRE_BACKUP_URL    e.g. https://cllove.zeabur.app/backup
+#   OMBRE_BACKUP_TOKEN  must match the env var of the same name on Zeabur
+
+on:
+  schedule:
+    # 04:00 UTC daily = 12:00 Beijing time. Low-traffic window.
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: memory-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch backup tarball from Zeabur
+        env:
+          BACKUP_URL: ${{ secrets.OMBRE_BACKUP_URL }}
+          BACKUP_TOKEN: ${{ secrets.OMBRE_BACKUP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BACKUP_URL:-}" ] || [ -z "${BACKUP_TOKEN:-}" ]; then
+            echo "::error::OMBRE_BACKUP_URL or OMBRE_BACKUP_TOKEN secret is missing"
+            exit 1
+          fi
+          mkdir -p /tmp/ombre-backup
+          # --fail makes curl exit non-zero on 4xx/5xx; retry on transient errors.
+          curl --fail --silent --show-error \
+               --retry 4 --retry-delay 5 --retry-all-errors \
+               --max-time 120 \
+               -o /tmp/ombre-backup/buckets.tar.gz \
+               "${BACKUP_URL}?token=${BACKUP_TOKEN}"
+          ls -la /tmp/ombre-backup/buckets.tar.gz
+
+      - name: Replace backups/buckets/ with fresh contents
+        run: |
+          set -euo pipefail
+          rm -rf backups/buckets
+          mkdir -p backups/buckets backups/snapshots
+          # tarball contains a top-level `buckets/` dir → extracts into backups/
+          tar -xzf /tmp/ombre-backup/buckets.tar.gz -C backups/
+          # Quick sanity check
+          md_count=$(find backups/buckets -name '*.md' | wc -l)
+          echo "Extracted $md_count markdown files"
+          if [ "$md_count" -lt 1 ]; then
+            echo "::error::Refusing to commit empty backup"
+            exit 1
+          fi
+
+      - name: Save dated snapshot tarball
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          cp /tmp/ombre-backup/buckets.tar.gz "backups/snapshots/${DATE}.tar.gz"
+          # Keep only the last 60 dated snapshots; raw .md history already in git.
+          # 保留最近 60 个快照；逐文件历史 git 里已经有了。
+          ls -1t backups/snapshots/*.tar.gz | tail -n +61 | xargs -r rm -f
+
+      - name: Build manifest-latest.json
+        run: |
+          set -euo pipefail
+          pip install --quiet python-frontmatter
+          python3 .github/workflows/build_manifest.py backups/buckets backups/manifest-latest.json
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "ombre-backup-bot"
+          git config user.email "ombre-backup-bot@users.noreply.github.com"
+          git add backups/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          # Summarize the change for the commit message
+          DATE=$(date -u +%Y-%m-%d)
+          BUCKET_COUNT=$(find backups/buckets -name '*.md' | wc -l | tr -d ' ')
+          git commit -m "backup: memory vault snapshot ${DATE} (${BUCKET_COUNT} buckets)"
+          # Retry push on transient network errors
+          for attempt in 1 2 3 4; do
+            if git push origin HEAD; then
+              echo "Push succeeded on attempt $attempt"
+              exit 0
+            fi
+            sleep $((2 ** attempt))
+          done
+          echo "::error::Push failed after 4 attempts"
+          exit 1

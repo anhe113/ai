@@ -413,6 +413,68 @@ async def dream_hook(request):
 
 
 # =============================================================
+# /backup endpoint: full snapshot of buckets dir as tar.gz
+# 备份端点：buckets 目录完整快照（tar.gz 流式返回）
+#
+# Auth: ?token=<OMBRE_BACKUP_TOKEN> (constant-time compare).
+# If env var is unset or empty, endpoint returns 503 — refuses to
+# expose data without an explicit token configured.
+# =============================================================
+@mcp.custom_route("/backup", methods=["GET"])
+async def backup_endpoint(request):
+    from starlette.responses import Response, JSONResponse
+    import tarfile
+    import io
+
+    expected_token = os.environ.get("OMBRE_BACKUP_TOKEN", "").strip()
+    if not expected_token:
+        return JSONResponse(
+            {"error": "backup endpoint disabled: OMBRE_BACKUP_TOKEN not set"},
+            status_code=503,
+        )
+    provided = request.query_params.get("token", "")
+    if not hmac.compare_digest(provided, expected_token):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    buckets_dir = config["buckets_dir"]
+    if not os.path.isdir(buckets_dir):
+        return JSONResponse({"error": "buckets_dir not found"}, status_code=500)
+
+    # Build tar.gz in memory. 286KB current → ~50KB compressed; fits fine.
+    # If the dataset ever grows past a few MB we'll switch to a temp file.
+    try:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for root, dirs, files in os.walk(buckets_dir):
+                # Skip the dashboard auth file (contains password hash).
+                # 跳过 dashboard 密码哈希文件。
+                rel_root = os.path.relpath(root, buckets_dir)
+                for fname in files:
+                    if fname == ".dashboard_auth.json":
+                        continue
+                    full = os.path.join(root, fname)
+                    arcname = os.path.join(
+                        "buckets",
+                        "" if rel_root == "." else rel_root,
+                        fname,
+                    )
+                    tar.add(full, arcname=arcname)
+        data = buf.getvalue()
+        logger.info(f"Backup endpoint served: {len(data)} bytes")
+        return Response(
+            content=data,
+            media_type="application/gzip",
+            headers={
+                "Content-Disposition": 'attachment; filename="ombre-buckets.tar.gz"',
+                "X-Bucket-Count": str(len([f for r, _, fs in os.walk(buckets_dir) for f in fs if f.endswith(".md")])),
+            },
+        )
+    except Exception as e:
+        logger.error(f"Backup endpoint failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
 # Shared by hold and grow to avoid duplicate logic

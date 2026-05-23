@@ -16,6 +16,7 @@
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
 | `OMBRE_BREATH_HALF_LIFE_DAYS` | 否 | `14` | breath 浮现权重的时间衰减半衰期（天）；建议 14~30 之间，越小则最近事件越占优势。覆盖 `decay.half_life_days` 配置项。 |
+| `OMBRE_BACKUP_TOKEN` | 否 | — | 启用 `GET /backup` 端点的访问令牌。未设置时端点返回 503；设置后请求需带 `?token=<value>`。配合 `.github/workflows/backup.yml` 做定时备份。 |
 
 ## 说明
 
