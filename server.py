@@ -32,6 +32,15 @@
 #   Docker: docker-compose up
 # ============================================================
 
+# --- Eager numpy preload (Windows first-import deadlock workaround) ---
+# openai SDK's embedding response parser calls has_numpy() which triggers
+# a lazy `import numpy`. On Windows, first-time numpy C-extension load
+# (loader lock + Defender real-time scan) can hang for minutes, blocking
+# the GIL. Because the hang is in synchronous C extension load, asyncio
+# event loop stops — even asyncio.wait_for timeouts cannot fire.
+# Forcing the import at process startup pays the cost once, before any
+# async work, so embedding calls in the request path hit the import cache.
+import numpy as _eager_numpy_preload  # noqa: F401
 import os
 import sys
 import random
@@ -814,7 +823,13 @@ async def hold(
         )
         # --- Defensive timeouts to prevent indefinite MCP hangs ---
         # --- 防御性 timeout：避免某一步卡死把整个 MCP 调用锁死 ---
-        # See companion issue for incident report and diagnosis.
+        # NB: timeouts only fire if the asyncio event loop can turn. If the
+        # await calls down into synchronous C-extension load (e.g. lazy
+        # numpy import inside the openai SDK on first invocation), the GIL
+        # is held and wait_for's timer never runs. The eager `import numpy`
+        # at the top of this file is the actual root-cause fix for the
+        # 28-min hangs observed on first hold(feel=True) after install.
+        # See companion issue/PR for incident report and stack trace.
         try:
             await asyncio.wait_for(
                 embedding_engine.generate_and_store(bucket_id, content),
