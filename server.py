@@ -559,11 +559,19 @@ async def breath(
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
         pinned_results = []
+        pinned_token_budget = 5000
+        pinned_token_used = 0
         for b in pinned_buckets:
+            if pinned_token_used >= pinned_token_budget:
+                break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                summary_tokens = count_tokens_approx(summary)
+                if pinned_token_used + summary_tokens > pinned_token_budget:
+                    break
                 pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+                pinned_token_used += summary_tokens
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
                 continue
