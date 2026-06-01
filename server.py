@@ -42,6 +42,7 @@ import hmac
 import secrets
 import time
 import json as _json_lib
+import sqlite3
 import httpx
 
 
@@ -102,6 +103,56 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+
+# --- Events perception layer / 感知层事件系统 ---
+# iOS Shortcuts report app usage → stored in SQLite → Claude reads via sense() tool
+# iOS 快捷指令上报 App 使用 → SQLite 存储 → Claude 通过 sense() 工具读取
+OMBRE_EVENTS_TOKEN = os.environ.get("OMBRE_EVENTS_TOKEN", "")
+_events_db_path = os.path.join(config["buckets_dir"], "events.db")
+
+def _init_events_db():
+    """Create events table if not exists."""
+    conn = sqlite3.connect(_events_db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)")
+    conn.commit()
+    conn.close()
+
+def _record_event(event_type: str, value: str) -> bool:
+    """Record an event, with 5-min dedup for same type. Returns True if recorded."""
+    conn = sqlite3.connect(_events_db_path)
+    # Dedup: skip if same type within 5 minutes
+    row = conn.execute(
+        "SELECT id FROM events WHERE type = ? AND created_at > datetime('now', '-5 minutes') LIMIT 1",
+        (event_type,)
+    ).fetchone()
+    if row:
+        conn.close()
+        return False
+    conn.execute("INSERT INTO events (type, value) VALUES (?, ?)", (event_type, value))
+    conn.commit()
+    conn.close()
+    return True
+
+def _get_recent_events(hours: int = 6, limit: int = 50) -> list[dict]:
+    """Get recent events within the specified hours."""
+    conn = sqlite3.connect(_events_db_path)
+    rows = conn.execute(
+        "SELECT type, value, created_at FROM events WHERE created_at > datetime('now', ? || ' hours') ORDER BY created_at DESC LIMIT ?",
+        (f"-{hours}", limit)
+    ).fetchall()
+    conn.close()
+    return [{"type": r[0], "value": r[1], "time": r[2]} for r in rows]
+
+_init_events_db()
+logger.info(f"Events DB initialized at {_events_db_path}")
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -1273,6 +1324,20 @@ async def now() -> str:
     from datetime import datetime, timezone, timedelta
     aest = timezone(timedelta(hours=10))
     return datetime.now(aest).strftime("%Y-%m-%d %H:%M:%S AEST (%A)")
+
+
+@mcp.tool()
+async def sense(hours: int = 6) -> str:
+    """sense - 感知层：查看用户最近的手机活动（由 iOS 快捷指令自动上报）。
+    hours: 查看最近几小时的活动，默认 6 小时。
+    无活动时返回空。"""
+    events = _get_recent_events(hours=hours)
+    if not events:
+        return f"最近 {hours} 小时无活动记录。"
+    lines = [f"最近 {hours} 小时的活动（{len(events)} 条）："]
+    for e in events:
+        lines.append(f"  - {e['time']}  {e['type']}: {e['value']}")
+    return "\n".join(lines)
     
 # =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
@@ -1918,6 +1983,40 @@ async def api_system_status(request):
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
+# Events perception layer API / 感知层事件 API
+# iOS Shortcuts → GET /api/events/report?type=...&value=...&token=...
+# =============================================================
+
+@mcp.custom_route("/api/events/report", methods=["GET"])
+async def api_events_report(request):
+    """Receive event from iOS Shortcuts. Auth via token parameter."""
+    from starlette.responses import JSONResponse
+    # Token auth (not cookie — iOS Shortcuts can't do cookies)
+    token = request.query_params.get("token", "")
+    if not OMBRE_EVENTS_TOKEN or token != OMBRE_EVENTS_TOKEN:
+        return JSONResponse({"error": "invalid token"}, status_code=401)
+    
+    event_type = request.query_params.get("type", "")
+    value = request.query_params.get("value", "")
+    if not event_type or not value:
+        return JSONResponse({"error": "missing type or value"}, status_code=400)
+    
+    recorded = _record_event(event_type, value)
+    return JSONResponse({"ok": True, "recorded": recorded})
+
+
+@mcp.custom_route("/api/events/recent", methods=["GET"])
+async def api_events_recent(request):
+    """Get recent events (dashboard auth required)."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    hours = int(request.query_params.get("hours", "6"))
+    events = _get_recent_events(hours=hours)
+    return JSONResponse({"events": events, "count": len(events)})
 
 
 # --- Entry point / 启动入口 ---
