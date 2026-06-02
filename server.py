@@ -1326,7 +1326,7 @@ async def now() -> str:
     return datetime.now(aest).strftime("%Y-%m-%d %H:%M:%S AEST (%A)")
 
 @mcp.tool()
- async def sense(hours: int = 2) -> str:
+async def sense(hours: int = 2) -> str:
      """sense - 感知层：查看用户最近的手机活动..."""
      events = _get_recent_events(hours=hours)
      if not events:
