@@ -42,6 +42,7 @@ import hmac
 import secrets
 import time
 import json as _json_lib
+import sqlite3
 import httpx
 
 
@@ -102,6 +103,56 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+
+# --- Events perception layer / 感知层事件系统 ---
+# iOS Shortcuts report app usage → stored in SQLite → Claude reads via sense() tool
+# iOS 快捷指令上报 App 使用 → SQLite 存储 → Claude 通过 sense() 工具读取
+OMBRE_EVENTS_TOKEN = os.environ.get("OMBRE_EVENTS_TOKEN", "")
+_events_db_path = os.path.join(config["buckets_dir"], "events.db")
+
+def _init_events_db():
+    """Create events table if not exists."""
+    conn = sqlite3.connect(_events_db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)")
+    conn.commit()
+    conn.close()
+
+def _record_event(event_type: str, value: str) -> bool:
+    """Record an event, with 5-min dedup for same type. Returns True if recorded."""
+    conn = sqlite3.connect(_events_db_path)
+    # Dedup: skip if same type within 5 minutes
+    row = conn.execute(
+        "SELECT id FROM events WHERE type = ? AND created_at > datetime('now', '-5 minutes') LIMIT 1",
+        (event_type,)
+    ).fetchone()
+    if row:
+        conn.close()
+        return False
+    conn.execute("INSERT INTO events (type, value) VALUES (?, ?)", (event_type, value))
+    conn.commit()
+    conn.close()
+    return True
+
+def _get_recent_events(hours: int = 6, limit: int = 50) -> list[dict]:
+    """Get recent events within the specified hours."""
+    conn = sqlite3.connect(_events_db_path)
+    rows = conn.execute(
+        "SELECT type, value, created_at FROM events WHERE created_at > datetime('now', ? || ' hours') ORDER BY created_at DESC LIMIT ?",
+        (f"-{hours}", limit)
+    ).fetchall()
+    conn.close()
+    return [{"type": r[0], "value": r[1], "time": r[2]} for r in rows]
+
+_init_events_db()
+logger.info(f"Events DB initialized at {_events_db_path}")
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -504,7 +555,7 @@ async def breath(
     max_results: int = 20,
     importance_min: int = -1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """breath - 检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -559,11 +610,19 @@ async def breath(
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
         pinned_results = []
+        pinned_token_budget = 5000
+        pinned_token_used = 0
         for b in pinned_buckets:
+            if pinned_token_used >= pinned_token_budget:
+                break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                summary_tokens = count_tokens_approx(summary)
+                if pinned_token_used + summary_tokens > pinned_token_budget:
+                    break
                 pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+                pinned_token_used += summary_tokens
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
                 continue
@@ -624,7 +683,7 @@ async def breath(
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
         # Hard cap: never surface more than max_results buckets
-        candidates = candidates[:max_results]
+        candidates = candidates[:min(max_results, 8)]
 
         dynamic_results = []
         for b in candidates:
@@ -786,7 +845,7 @@ async def hold(
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """hold - 存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -892,7 +951,7 @@ async def hold(
 # =============================================================
 @mcp.tool()
 async def grow(content: str) -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
+    """grow - 日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -990,7 +1049,7 @@ async def trace(
     content: str = "",
     delete: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1069,7 +1128,7 @@ async def trace(
 # =============================================================
 @mcp.tool()
 async def pulse(include_archive: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+    """pulse - 系统状态+记忆桶列表。include_archive=True含归档。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -1140,7 +1199,7 @@ async def pulse(include_archive: bool = False) -> str:
 # =============================================================
 @mcp.tool()
 async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+    """dream - 做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
     await decay_engine.ensure_started()
 
     try:
@@ -1257,8 +1316,29 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+    
+# =============================================================
+@mcp.tool()
+async def now() -> str:
+    """now - 返回当前AEST时间。"""
+    from datetime import datetime, timezone, timedelta
+    aest = timezone(timedelta(hours=10))
+    return datetime.now(aest).strftime("%Y-%m-%d %H:%M:%S AEST (%A)")
 
 
+@mcp.tool()
+async def sense(hours: int = 6) -> str:
+    """sense - 感知层：查看用户最近的手机活动（由 iOS 快捷指令自动上报）。
+    hours: 查看最近几小时的活动，默认 6 小时。
+    无活动时返回空。"""
+    events = _get_recent_events(hours=hours)
+    if not events:
+        return f"最近 {hours} 小时无活动记录。"
+    lines = [f"最近 {hours} 小时的活动（{len(events)} 条）："]
+    for e in events:
+        lines.append(f"  - {e['time']}  {e['type']}: {e['value']}")
+    return "\n".join(lines)
+    
 # =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
@@ -1903,6 +1983,43 @@ async def api_system_status(request):
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
+# Events perception layer API / 感知层事件 API
+# iOS Shortcuts → GET /api/events/report?type=...&value=...&token=...
+# =============================================================
+
+@mcp.custom_route("/api/events/report", methods=["GET"])
+async def api_events_report(request):
+    """Receive event from iOS Shortcuts. Auth via token parameter."""
+    from starlette.responses import JSONResponse
+    # Token auth (not cookie — iOS Shortcuts can't do cookies)
+    token = request.query_params.get("token", "")
+    if not OMBRE_EVENTS_TOKEN or token != OMBRE_EVENTS_TOKEN:
+        return JSONResponse({"error": "invalid token"}, status_code=401)
+    
+    event_type = request.query_params.get("type", "")
+    value = request.query_params.get("value", "")
+    if not event_type or not value:
+        return JSONResponse({"error": "missing type or value"}, status_code=400)
+    
+    recorded = _record_event(event_type, value)
+    return JSONResponse({"ok": True, "recorded": recorded})
+
+
+@mcp.custom_route("/api/events/recent", methods=["GET"])
+async def api_events_recent(request):
+    """Get recent events (dashboard auth or token auth)."""
+    from starlette.responses import JSONResponse
+    # Accept either cookie auth or token auth
+    token = request.query_params.get("token", "")
+    if not (OMBRE_EVENTS_TOKEN and token == OMBRE_EVENTS_TOKEN):
+        err = _require_auth(request)
+        if err: return err
+    hours = int(request.query_params.get("hours", "6"))
+    events = _get_recent_events(hours=hours)
+    return JSONResponse({"events": events, "count": len(events)})
 
 
 # --- Entry point / 启动入口 ---
